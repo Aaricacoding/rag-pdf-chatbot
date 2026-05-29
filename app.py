@@ -97,4 +97,5 @@ def ask_question():
 if __name__ == "__main__":
     os.makedirs("static", exist_ok=True)
     print("\n🚀 RAG PDF Chatbot running at: http://127.0.0.1:5000\n")
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    # HuggingFace Spaces uses port 7860
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 7860)))
