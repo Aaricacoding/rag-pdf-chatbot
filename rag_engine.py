@@ -1,118 +1,115 @@
-# rag_engine.py — Core RAG pipeline using LangChain + FAISS + HuggingFace
-# This file handles: PDF loading → text splitting → embedding → vector indexing → QA chain
+# rag_engine.py — RAG pipeline with smart PDF loading + Groq API
+# Strategy: try PyPDFLoader first (clean text), fall back to OCR only if needed
 
-# LangChain's PDF loader — reads PDF pages and converts them into Document objects
-from langchain_community.document_loaders import PyPDFLoader
-
-# RecursiveCharacterTextSplitter — splits long text into overlapping chunks
-# so context isn't lost at chunk boundaries when we search later
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-
-# HuggingFaceEmbeddings — converts text chunks into semantic float vectors
-# Uses sentence-transformers/all-MiniLM-L6-v2 — free, fast, no API key needed
-from langchain_community.embeddings import HuggingFaceEmbeddings
-
-# FAISS — Facebook AI Similarity Search, a local vector database
-# Stores embeddings and lets us find the most relevant chunks by cosine similarity
-from langchain_community.vectorstores import FAISS
-
-# HuggingFacePipeline — wraps a HuggingFace transformers pipeline
-# so LangChain can treat it as a standard LLM object
-from langchain_community.llms import HuggingFacePipeline
-
-# RetrievalQA — LangChain chain that connects: retriever → prompt → LLM → answer
-from langchain.chains import RetrievalQA
-
-# transformers pipeline — loads a local open-source LLM (no OpenAI key needed)
-from transformers import pipeline
-
-import os  # standard os module for file path utilities
+import os
+from langchain_community.document_loaders import PyPDFLoader        # clean text extraction
+from langchain_text_splitters import RecursiveCharacterTextSplitter  # chunk splitter
+from langchain_huggingface import HuggingFaceEmbeddings              # local embeddings
+from langchain_community.vectorstores import FAISS                   # vector database
+from langchain_groq import ChatGroq                                  # Groq fast LLM
+from langchain_core.prompts import PromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnablePassthrough
 
 
 def load_and_index_pdf(pdf_path: str) -> FAISS:
     """
-    Loads a PDF from disk, splits it into chunks, embeds each chunk,
-    and stores everything in a FAISS vector index for fast similarity search.
-
-    Args:
-        pdf_path (str): Absolute or relative path to the PDF file
-
-    Returns:
-        FAISS: An indexed vector store ready for .similarity_search() or .as_retriever()
+    Smart PDF loader — uses PyPDFLoader (clean, fast, accurate).
+    OCR is only needed for truly scanned PDFs with zero embedded text.
+    Your PDFs have embedded text so PyPDFLoader gives much cleaner results.
     """
 
-    # Step 1: Load PDF — each page becomes a Document(page_content=str, metadata={page: N})
+    print("[INFO] Loading PDF with PyPDFLoader...")
     loader = PyPDFLoader(pdf_path)
-    documents = loader.load()  # list of Document objects, one per PDF page
+    documents = loader.load()  # each page → Document(page_content, metadata)
 
-    # Step 2: Split documents into smaller chunks
-    # chunk_size=500 chars keeps each chunk focused on one topic
-    # chunk_overlap=50 chars so sentences that span chunk boundaries aren't lost
+    # Check how much text was actually extracted
+    total_text = sum(len(doc.page_content) for doc in documents)
+    print(f"[INFO] Extracted {total_text} characters from {len(documents)} pages")
+
+    # If PDF has very little text (scanned/image-only), warn the user
+    if total_text < 100:
+        raise ValueError(
+            "This PDF has almost no extractable text. "
+            "It may be a scanned document. OCR support coming soon."
+        )
+
+    # Split into 500-char chunks with 50-char overlap
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=500,    # max characters per chunk — tune lower for precision, higher for context
-        chunk_overlap=50   # overlap between consecutive chunks to preserve context
+        chunk_size=500,
+        chunk_overlap=50
     )
-    chunks = splitter.split_documents(documents)  # returns a larger list of smaller Documents
+    chunks = splitter.split_documents(documents)
+    print(f"[INFO] Split into {len(chunks)} chunks")
 
-    # Step 3: Load the embedding model
-    # all-MiniLM-L6-v2 is ~80MB, runs on CPU, produces 384-dimensional vectors
-    # model_kwargs device='cpu' — ensures it works on any machine without GPU
+    # Embed with all-MiniLM-L6-v2 — fast, local, no API key
     embeddings = HuggingFaceEmbeddings(
         model_name="sentence-transformers/all-MiniLM-L6-v2",
-        model_kwargs={"device": "cpu"}  # change to "cuda" if you have an NVIDIA GPU
+        model_kwargs={"device": "cpu"}
     )
 
-    # Step 4: Build FAISS index
-    # This embeds every chunk and stores (vector, chunk_text) pairs
-    # from_documents handles the embed + index in one call
+    # Build FAISS index
     vector_store = FAISS.from_documents(chunks, embeddings)
+    print("[INFO] FAISS index ready")
 
-    return vector_store  # ready for querying
+    return vector_store
 
 
-def build_qa_chain(vector_store: FAISS) -> RetrievalQA:
+def build_qa_chain(vector_store: FAISS):
     """
-    Builds a full RetrievalQA chain by combining:
-    - A FAISS retriever (finds relevant chunks)
-    - A local HuggingFace LLM (generates the answer)
-
-    Args:
-        vector_store (FAISS): The indexed vector store from load_and_index_pdf()
-
-    Returns:
-        RetrievalQA: A callable chain — use as chain({"query": "your question"})
+    Builds LCEL chain: FAISS retriever + Groq Llama 3.1 LLM.
+    Returns (chain, retriever).
     """
 
-    # Step 1: Load a lightweight open-source LLM locally
-    # google/flan-t5-base is ~250MB, good at Q&A, works without any API key
-    # task="text2text-generation" is suited for question → answer style tasks
-    # max_new_tokens=256 caps response length so it runs fast on CPU
-    hf_pipeline = pipeline(
-        "text2text-generation",       # generation task type
-        model="google/flan-t5-base",  # small but effective instruction-following model
-        max_new_tokens=256,           # maximum tokens in the generated answer
-        do_sample=False               # deterministic output — same question → same answer
+    groq_api_key = os.environ.get("GROQ_API_KEY")
+    if not groq_api_key:
+        raise ValueError(
+            "GROQ_API_KEY not found. "
+            "Add it to your .env file. Get free key at https://console.groq.com"
+        )
+
+    # Groq LLM — llama-3.1-8b-instant: fast, free, capable
+    llm = ChatGroq(
+        model="llama-3.1-8b-instant",
+        temperature=0,           # deterministic answers
+        groq_api_key=groq_api_key
     )
 
-    # Step 2: Wrap the HF pipeline so LangChain recognizes it as an LLM
-    llm = HuggingFacePipeline(pipeline=hf_pipeline)
+    # Fetch top 4 chunks for more context per question
+    retriever = vector_store.as_retriever(search_kwargs={"k": 4})
 
-    # Step 3: Convert the vector store into a retriever
-    # k=3 means: for each question, fetch the 3 most relevant text chunks
-    # increasing k gives more context but also more noise
-    retriever = vector_store.as_retriever(
-        search_kwargs={"k": 3}  # number of top chunks to retrieve
+    # Prompt — answer only from context, be natural and helpful
+    prompt = PromptTemplate.from_template(
+        "You are a helpful assistant analyzing a document.\n"
+        "Answer the question using ONLY the information in the context below.\n"
+        "If the answer is not in the context, say 'This information is not in the document.'\n"
+        "Be clear, concise, and natural.\n\n"
+        "Context:\n{context}\n\n"
+        "Question: {question}\n\n"
+        "Answer:"
     )
 
-    # Step 4: Create the RetrievalQA chain
-    # chain_type="stuff" = concatenate all retrieved chunks into one prompt
-    # Works well when chunks are small (<=500 chars each)
-    # return_source_documents=True so we can show which pages the answer came from
-    qa_chain = RetrievalQA.from_chain_type(
-        llm=llm,                          # the language model for answer generation
-        chain_type="stuff",               # prompt strategy: stuff all chunks together
-        retriever=retriever,              # the FAISS-based retriever
-        return_source_documents=True      # include source chunks in the output dict
+    def format_docs(docs):
+        # Join chunks with separator so LLM sees clear boundaries
+        return "\n\n---\n\n".join(doc.page_content for doc in docs)
+
+    # LCEL chain
+    chain = (
+        {
+            "context":  retriever | format_docs,
+            "question": RunnablePassthrough()
+        }
+        | prompt
+        | llm
+        | StrOutputParser()
     )
 
-    return qa_chain  # caller can now do: result = qa_chain({"query": "What is X?"})
+    return chain, retriever
+
+    # Pre-load embedding model at startup so first user request isn't slow
+print("[INFO] Pre-loading embedding model...")
+HuggingFaceEmbeddings(
+    model_name="sentence-transformers/all-MiniLM-L6-v2",
+    model_kwargs={"device": "cpu"}
+)
+print("[INFO] Embedding model ready")
